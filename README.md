@@ -1,6 +1,7 @@
 ## Overview
 
 Leverage a ESP32-LyraTD-MSC V2.2 board to enhance speech clarity through the use of the DSP to process the audio signals, the top board button and LEDs, and the 3 microphone array.
+https://docs.espressif.com/projects/esp-adf/en/latest/design-guide/dev-boards/get-started-esp32-lyratd-msc.html#what-you-need
 
 ## Features
 - Uses the microphone array to capture sound in either a omni directional or beam focused configuration, this mode can be changed by the user by pressing the mode button.
@@ -11,8 +12,8 @@ Leverage a ESP32-LyraTD-MSC V2.2 board to enhance speech clarity through the use
 
 ## IDF and ADF version information
 
->idf.py --version
+- idf.py --version
 ESP-IDF v5.3.4-145-gb019b2e63d-dirty
 
->git -C %ADF_PATH% describe --tags --always
+- git -C %ADF_PATH% describe --tags --always
 v2.7-149-gad4ac707
