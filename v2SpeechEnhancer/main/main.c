@@ -1,332 +1,542 @@
-// SPDX-License-Identifier: MIT
-// eaudio — LyraTD-MSC (ESP32 + ZL38063) with ADC buttons/LEDs
-// Target: ESP-IDF v5.3.x, ESP-ADF master — LIGHT CLEAN (NS+AGC), TYPE1 "M"
+// main.c — ESP32-LyraTD-MSC v2.2  |  IDF v5.3.x + ADF master (older audio_hal API)
+// - LEDs via IS31FL3216 (standard ADF peripheral)
+// - Buttons via esp_adc/adc_oneshot: median + hysteresis + debounce
+// - I2S MASTER full-duplex @ 48 kHz / 16-bit
+// - Startup tone; PLAY toggles bridge
+// - MODE cycles: 0=RAW, 1=ENH (HPF+AGC+Limiter), 2=DSP (Twolf) + post-gain/EQ/limiter
+// - In DSP mode, VOL± adjusts Twolf HAL volume (+ small software post-gain trim)
+// - SET in DSP mode toggles BRIGHT tilt EQ
+//
+// Build note: add audio_hal to REQUIRES in main/CMakeLists.txt, e.g.:
+//   idf_component_register(SRCS "main.c" INCLUDE_DIRS "." REQUIRES audio_hal esp_peripherals driver esp_driver_i2s)
 
-#include <stdio.h>
+#include <math.h>
 #include <string.h>
-#include <stdbool.h>
+#include <stdio.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+
 #include "esp_log.h"
-#include "nvs_flash.h"
+#include "esp_err.h"
+
 #include "driver/gpio.h"
+#include "driver/i2s_std.h"
+#include "esp_heap_caps.h"
 
-// ADC One-Shot + Calibration (IDF 5.x)
-#include "esp_adc/adc_oneshot.h"
-#include "esp_adc/adc_cali.h"
-#include "esp_adc/adc_cali_scheme.h"
+#include "esp_adc/adc_oneshot.h"   // modern ADC API
 
-// ADF
-#include "audio_pipeline.h"
-#include "audio_element.h"
-#include "audio_common.h"
-#include "i2s_stream.h"
-#include "algorithm_stream.h"
-#include "audio_hal.h"
-#include "board.h"
+#include "esp_peripherals.h"
+#include "periph_is31fl3216.h"
+#include "audio_hal.h"              // Twolf (ZL38063) HAL volume/mute/start
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// ---------- Board pins (LyraTD-MSC v2.2)
+#define PIN_I2S_BCLK    GPIO_NUM_5
+#define PIN_I2S_LRCLK   GPIO_NUM_25
+#define PIN_I2S_DOUT    GPIO_NUM_26   // ESP32 -> DSP SDIN (playback)
+#define PIN_I2S_DIN     GPIO_NUM_35   // DSP SDOUT -> ESP32 (capture)
+
+#define PIN_TOP_LDO_EN  GPIO_NUM_21   // Top board LDO (ACTIVE-LOW, hold LOW to enable)
+#define PIN_DSP_RESET   GPIO_NUM_19   // ZL38063 reset (active-low) — keep released (HIGH)
+#define PIN_PA_EN       GPIO_NUM_22   // Power amp enable (HIGH on)
+#define PIN_HP_DET      GPIO_NUM_36   // Headphone detect (informational)
+
+// ---------- Audio / tasks
+#define SAMPLE_RATE_HZ  48000
+#define TONE_MS         1200
+
+// ---------- Button ladder (ADC1_CH3 = GPIO39) — from schematic
+// Set = 0.30V, Play = 0.82V, Rec = 1.34V, Mode = 1.80V, Vol- = 2.27V, Vol+ = 2.88V
+#define MV(x)           (x)
+#define BTN_B0          MV(150)
+#define BTN_B1          MV((300+820)/2)    // 560 mV
+#define BTN_B2          MV((820+1340)/2)   // 1080 mV
+#define BTN_B3          MV((1340+1800)/2)  // 1570 mV
+#define BTN_B4          MV((1800+2270)/2)  // 2035 mV
+#define BTN_B5          MV((2270+2880)/2)  // 2575 mV
+#define BTN_B6          MV(3300)
+
+#define BTN_HYS_MV      60
+#define DEBOUNCE_MEDS   2
+
+// ---------- Types
+typedef enum { BTN_NONE=0, BTN_SET, BTN_PLAY, BTN_REC, BTN_MODE, BTN_VOLDN, BTN_VOLUP } btn_t;
+typedef enum { MODE_RAW=0, MODE_ENH=1, MODE_DSP=2 } proc_mode_t;
 
 static const char *TAG = "eaudio_main";
 
-// ===== LEDs =====
-#define GPIO_LED_MODE     2
-#define GPIO_LED_CLEAN    4
-#define GPIO_LED_BF       5
+// ---------- Globals
+static esp_periph_set_handle_t   g_periph_set = NULL;
+static esp_periph_handle_t       g_led        = NULL;
 
-// ===== ADC buttons =====
-#define BTN_ADC_UNIT          ADC_UNIT_1
-#define BTN_ADC_CHANNEL       ADC_CHANNEL_6
-#define BTN_ADC_ATTEN         ADC_ATTEN_DB_12
-#define BTN_ADC_BITWIDTH      ADC_BITWIDTH_DEFAULT
-#define BTN_SAMPLE_COUNT      8
-#define BTN_STABLE_SAMPLES    3
-#define BTN_POLL_MS           30
+static adc_oneshot_unit_handle_t g_adc        = NULL;
 
-// Audio
-#define E_AUDIO_RATE_HZ          16000
-#define E_AUDIO_VOL_HP_DEFAULT   70
-#define E_AEC_INIT_DELAY_MS      70
-#define E_AEC_MIN_MS             0
-#define E_AEC_MAX_MS             300
+static i2s_chan_handle_t g_tx = NULL;
+static i2s_chan_handle_t g_rx = NULL;
 
-typedef enum { MODE_PASSTHROUGH=0, MODE_CLEAN=1, MODE_BF_PLACEHOLDER=2, MODE_MAX } run_mode_t;
+static audio_hal_handle_t        g_hal        = NULL;  // Twolf HAL
+// NOTE: older ADF requires passing a function table for the specific codec:
+extern audio_hal_func_t          AUDIO_CODEC_ZL38063_DEFAULT_HANDLE;
 
-typedef enum { BTN_VOL_PLUS=0, BTN_VOL_MINUS, BTN_MODE, BTN_REC, BTN_PLAY, BTN_SET, BTN_COUNT, BTN_NONE=0xFF } btn_id_t;
+static volatile bool        g_bridge_on   = false;     // PLAY toggles this
+static volatile proc_mode_t g_mode        = MODE_ENH;  // start Enhanced
+static volatile int         g_volume_pct  = 80;        // tone/ENH target
 
-static const char *kButtons[BTN_COUNT] = {"VOL+", "VOL-", "MODE", "REC", "PLAY", "SET"};
-static const int   kButtonLevels_mV[BTN_COUNT] = {2880, 2270, 1800, 1340, 820, 300};
-static int         sThresh_mV[BTN_COUNT - 1];
+// DSP-mode post-processing controls
+static volatile float       g_dsp_gain_db   = 6.0f;    // post-gain after DSP
+static volatile bool        g_dsp_bright_on = true;    // tilt EQ on/off
 
-// --------- Globals ---------
-static audio_board_handle_t board = NULL;
+// =====================================================================
+//                        LEDS
+// =====================================================================
+static void leds_init(void)
+{
+    esp_periph_config_t pcfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
+    g_periph_set = esp_periph_set_init(&pcfg);
 
-// CLEAN pipeline
-static audio_pipeline_handle_t pipe_clean = NULL;
-static audio_element_handle_t  clean_reader = NULL;
-static audio_element_handle_t  clean_algo   = NULL;
-static audio_element_handle_t  clean_writer = NULL;
-static ringbuf_handle_t        clean_writer_rb = NULL;
+    periph_is31fl3216_cfg_t cfg = (periph_is31fl3216_cfg_t){0};
+    cfg.state = IS31FL3216_STATE_ON;
+    for (int i=0; i<14; ++i) { cfg.is31fl3216_pattern |= (1u<<i); cfg.duty[i] = 2; }
 
-// PASS pipeline
-static audio_pipeline_handle_t pipe_pass = NULL;
-static audio_element_handle_t  pass_reader = NULL;
-static audio_element_handle_t  pass_writer = NULL;
-
-// State
-static run_mode_t run_mode = MODE_CLEAN;
-static int  hp_volume = E_AUDIO_VOL_HP_DEFAULT;
-static bool hp_mute   = false;
-static int  aec_delay_ms = E_AEC_INIT_DELAY_MS;
-
-// ADC
-static adc_oneshot_unit_handle_t s_adc = NULL;
-static adc_cali_handle_t s_adc_cali = NULL;
-static bool s_adc_cali_enabled = false;
-
-// ===== LED helpers =====
-static void leds_hw_write(bool m, bool c, bool b) {
-    gpio_set_level(GPIO_LED_MODE, m);
-    gpio_set_level(GPIO_LED_CLEAN, c);
-    gpio_set_level(GPIO_LED_BF, b);
+    g_led = periph_is31fl3216_init(&cfg);
+    if (!g_led) { ESP_LOGW(TAG, "IS31FL3216 init failed"); return; }
+    esp_periph_start(g_periph_set, g_led);
+    periph_is31fl3216_set_state(g_led, IS31FL3216_STATE_ON);
+    periph_is31fl3216_set_blink_pattern(g_led, cfg.is31fl3216_pattern);
+    ESP_LOGI(TAG, "IS31FL3216 started (baseline faint ON ch0..13).");
 }
-static void leds_init(void) {
+
+static inline void leds_flash_all(uint8_t duty)
+{
+    for (int i=0;i<14;++i) periph_is31fl3216_set_duty(g_led, i, duty);
+}
+
+static void leds_task(void *arg)
+{
+    int pos = 0;
+    while (1) {
+        for (int ch=0; ch<14; ++ch) periph_is31fl3216_set_duty(g_led, ch, 2);
+        periph_is31fl3216_set_duty(g_led, pos, 60);
+        periph_is31fl3216_set_blink_pattern(g_led, (1u<<pos));
+        pos = (pos+1)%14;
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+}
+
+// =====================================================================
+//                        POWER RAILS
+// =====================================================================
+static void rails_init(void)
+{
     gpio_config_t io = {
-        .pin_bit_mask = (1ULL<<GPIO_LED_MODE) | (1ULL<<GPIO_LED_CLEAN) | (1ULL<<GPIO_LED_BF),
-        .mode = GPIO_MODE_OUTPUT, .pull_up_en = 0, .pull_down_en = 0, .intr_type = GPIO_INTR_DISABLE
+        .pin_bit_mask = (1ULL<<PIN_TOP_LDO_EN) | (1ULL<<PIN_DSP_RESET) | (1ULL<<PIN_PA_EN),
+        .mode = GPIO_MODE_OUTPUT
     };
     gpio_config(&io);
-    leds_hw_write(false,false,false);
-}
-static void leds_show_mode(run_mode_t m) {
-    leds_hw_write(m==MODE_PASSTHROUGH, m==MODE_CLEAN, m==MODE_BF_PLACEHOLDER);
+
+    gpio_set_level(PIN_TOP_LDO_EN, 0);  // active-LOW -> enable
+    gpio_set_level(PIN_DSP_RESET,   1); // release reset
+    gpio_set_level(PIN_PA_EN,       1); // PA on
+
+    ESP_LOGI(TAG, "Top LDO ON (GPIO21 LOW), DSP reset released, PA enabled.");
+
+    gpio_config_t in = { .pin_bit_mask=(1ULL<<PIN_HP_DET), .mode=GPIO_MODE_INPUT };
+    gpio_config(&in);
+    ESP_LOGI(TAG, "Headphone detect: %d", gpio_get_level(PIN_HP_DET));
 }
 
-// ===== Volume / Mute =====
-static void apply_volume(void) {
-    if (!board) return;
-    audio_hal_set_mute(board->audio_hal, hp_mute);
-    if (!hp_mute) audio_hal_set_volume(board->audio_hal, hp_volume);
-    ESP_LOGI(TAG, "HP vol=%d mute=%d", hp_volume, hp_mute);
-}
-
-// ===== AEC delay (kept for future, harmless while AEC is OFF) =====
-static void apply_aec_delay(void) {
-    if (aec_delay_ms < E_AEC_MIN_MS) aec_delay_ms = E_AEC_MIN_MS;
-    if (aec_delay_ms > E_AEC_MAX_MS) aec_delay_ms = E_AEC_MAX_MS;
-    if (clean_algo && clean_writer_rb) {
-        algo_stream_set_delay(clean_algo, clean_writer_rb, aec_delay_ms);
-        ESP_LOGI(TAG, "AEC delay -> %d ms", aec_delay_ms);
-    }
-}
-
-// ===== ADC buttons =====
-static void adc_init_buttons(void)
+// =====================================================================
+//                        I2S MASTER Full-Duplex
+// =====================================================================
+static esp_err_t i2s_open_master(void)
 {
-    for (int i = 0; i < BTN_COUNT - 1; ++i) sThresh_mV[i] = (kButtonLevels_mV[i] + kButtonLevels_mV[i+1]) / 2;
+    esp_err_t err;
 
-    adc_oneshot_unit_init_cfg_t unit_cfg = {.unit_id = BTN_ADC_UNIT, .ulp_mode = ADC_ULP_MODE_DISABLE};
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &s_adc));
+    i2s_chan_config_t cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    cfg.auto_clear = true;
+    err = i2s_new_channel(&cfg, &g_tx, &g_rx);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "i2s_new_channel err=%d", err); return err; }
 
-    adc_oneshot_chan_cfg_t chan_cfg = {.bitwidth = BTN_ADC_BITWIDTH, .atten = BTN_ADC_ATTEN};
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc, BTN_ADC_CHANNEL, &chan_cfg));
+    i2s_std_config_t std = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE_HZ),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = PIN_I2S_BCLK,
+            .ws   = PIN_I2S_LRCLK,
+            .dout = PIN_I2S_DOUT,
+            .din  = PIN_I2S_DIN,
+            .invert_flags = { .mclk_inv=false, .bclk_inv=false, .ws_inv=false },
+        },
+    };
+    err = i2s_channel_init_std_mode(g_tx, &std);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "i2s tx init err=%d", err); return err; }
+    err = i2s_channel_init_std_mode(g_rx, &std);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "i2s rx init err=%d", err); return err; }
 
-    adc_cali_line_fitting_config_t cali_cfg = {.unit_id = BTN_ADC_UNIT, .atten = BTN_ADC_ATTEN, .bitwidth = BTN_ADC_BITWIDTH};
-    if (adc_cali_create_scheme_line_fitting(&cali_cfg, &s_adc_cali) == ESP_OK) {
-        s_adc_cali_enabled = true;
-        ESP_LOGI(TAG, "ADC calibration: line fitting enabled");
-    } else {
-        s_adc_cali_enabled = false;
-        s_adc_cali = NULL;
-        ESP_LOGW(TAG, "ADC calibration not available, using raw-to-mV scaling");
-    }
+    ESP_ERROR_CHECK(i2s_channel_enable(g_tx));
+    ESP_ERROR_CHECK(i2s_channel_enable(g_rx));
+    ESP_LOGI(TAG, "I2S0 MASTER @ %d Hz, 16-bit stereo (BCLK=%d, LRCLK=%d, DOUT=%d, DIN=%d)",
+             SAMPLE_RATE_HZ, PIN_I2S_BCLK, PIN_I2S_LRCLK, PIN_I2S_DOUT, PIN_I2S_DIN);
+    return ESP_OK;
 }
-static int adc_read_avg_mv(void)
+
+// =====================================================================
+//                        BUTTONS (ADC oneshot)
+// =====================================================================
+static btn_t decode_button_mv_hyst(int mv, btn_t prev_bin)
 {
-    int acc_mv = 0;
-    for (int i = 0; i < BTN_SAMPLE_COUNT; ++i) {
-        int raw = 0, mv = 0;
-        if (adc_oneshot_read(s_adc, BTN_ADC_CHANNEL, &raw) != ESP_OK) continue;
-        if (s_adc_cali_enabled) adc_cali_raw_to_voltage(s_adc_cali, raw, &mv);
-        else mv = (raw * 3300) / 4095;
-        acc_mv += mv;
-    }
-    return acc_mv / BTN_SAMPLE_COUNT;
-}
-static btn_id_t decode_button_from_mv(int mv)
-{
-    if (mv > (kButtonLevels_mV[0] + 200)) return BTN_NONE;
-    for (int i = 0; i < BTN_COUNT - 1; ++i) if (mv >= sThresh_mV[i]) return (btn_id_t)i;
-    return (mv >= 0) ? (btn_id_t)(BTN_COUNT - 1) : BTN_NONE;
-}
+    int b0=BTN_B0, b1=BTN_B1, b2=BTN_B2, b3=BTN_B3, b4=BTN_B4, b5=BTN_B5, b6=BTN_B6;
 
-// ===== I2S helper =====
-static void i2s_set_clk_mono_16k(audio_element_handle_t i2s_elem)
-{ i2s_stream_set_clk(i2s_elem, E_AUDIO_RATE_HZ, 16, 1); }
-
-// ===== Pipelines =====
-static void stop_pipeline(audio_pipeline_handle_t p) {
-    if (!p) return;
-    audio_pipeline_stop(p);
-    audio_pipeline_wait_for_stop(p);
-    audio_pipeline_terminate(p);
-}
-
-static bool build_pipeline_clean(void)
-{
-    // reader
-    i2s_stream_cfg_t r_cfg = I2S_STREAM_CFG_DEFAULT();
-    r_cfg.type = AUDIO_STREAM_READER; r_cfg.task_core = 1; r_cfg.stack_in_ext = true;
-    clean_reader = i2s_stream_init(&r_cfg);
-    if (!clean_reader) { ESP_LOGE(TAG, "i2s reader init failed"); return false; }
-    i2s_set_clk_mono_16k(clean_reader);
-
-    // writer
-    i2s_stream_cfg_t w_cfg = I2S_STREAM_CFG_DEFAULT();
-    w_cfg.type = AUDIO_STREAM_WRITER; w_cfg.task_core = 1; w_cfg.stack_in_ext = true;
-    clean_writer = i2s_stream_init(&w_cfg);
-    if (!clean_writer) { ESP_LOGE(TAG, "i2s writer init failed"); audio_element_deinit(clean_reader); clean_reader=NULL; return false; }
-    i2s_set_clk_mono_16k(clean_writer);
-
-    // algorithm — TYPE1 "M" (single mic), NS+AGC only
-    algorithm_stream_cfg_t a_cfg = ALGORITHM_STREAM_CFG_DEFAULT();
-    a_cfg.input_type        = ALGORITHM_STREAM_INPUT_TYPE1; // one input stream
-    a_cfg.input_format      = "M";                          // single microphone channel
-    a_cfg.sample_rate       = E_AUDIO_RATE_HZ;
-    a_cfg.algo_mask         = (ALGORITHM_STREAM_USE_NS | ALGORITHM_STREAM_USE_AGC); // AEC OFF (lighter)
-    a_cfg.rec_linear_factor = 1;   // must be > 0 on ADF master
-    a_cfg.ref_linear_factor = 1;   // keep > 0 even unused
-    a_cfg.stack_in_ext      = true;
-
-    clean_algo = algo_stream_init(&a_cfg);
-    if (!clean_algo) {
-        ESP_LOGE(TAG, "algorithm_stream init failed — CLEAN disabled.");
-        audio_element_deinit(clean_reader); clean_reader = NULL;
-        audio_element_deinit(clean_writer); clean_writer = NULL;
-        return false;
+    switch (prev_bin) {
+        case BTN_SET:   b1 += BTN_HYS_MV; break;
+        case BTN_PLAY:  b1 -= BTN_HYS_MV; b2 += BTN_HYS_MV; break;
+        case BTN_REC:   b2 -= BTN_HYS_MV; b3 += BTN_HYS_MV; break;
+        case BTN_MODE:  b3 -= BTN_HYS_MV; b4 += BTN_HYS_MV; break;
+        case BTN_VOLDN: b4 -= BTN_HYS_MV; b5 += BTN_HYS_MV; break;
+        case BTN_VOLUP: b5 -= BTN_HYS_MV; break;
+        default: break;
     }
 
-    audio_pipeline_cfg_t p_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();
-    pipe_clean = audio_pipeline_init(&p_cfg);
-    if (!pipe_clean) {
-        ESP_LOGE(TAG, "pipeline init failed");
-        audio_element_deinit(clean_algo);   clean_algo   = NULL;
-        audio_element_deinit(clean_reader); clean_reader = NULL;
-        audio_element_deinit(clean_writer); clean_writer = NULL;
-        return false;
-    }
-
-    ESP_ERROR_CHECK(audio_pipeline_register(pipe_clean, clean_reader, "reader"));
-    ESP_ERROR_CHECK(audio_pipeline_register(pipe_clean, clean_algo,   "algo"));
-    ESP_ERROR_CHECK(audio_pipeline_register(pipe_clean, clean_writer, "writer"));
-    const char *links[] = {"reader", "algo", "writer"};
-    ESP_ERROR_CHECK(audio_pipeline_link(pipe_clean, links, 3));
-
-    clean_writer_rb = audio_element_get_output_ringbuf(clean_writer);
-    apply_aec_delay(); // harmless with AEC off
-    return true;
+    if (mv < b0) return BTN_NONE;
+    if (mv < b1) return BTN_SET;
+    if (mv < b2) return BTN_PLAY;
+    if (mv < b3) return BTN_REC;
+    if (mv < b4) return BTN_MODE;
+    if (mv < b5) return BTN_VOLDN;
+    if (mv < b6) return BTN_VOLUP;
+    return BTN_NONE;
 }
 
-static bool build_pipeline_pass(void)
+static void buttons_init(void)
 {
-    i2s_stream_cfg_t r_cfg = I2S_STREAM_CFG_DEFAULT();
-    r_cfg.type = AUDIO_STREAM_READER; r_cfg.task_core = 1; r_cfg.stack_in_ext = true;
-    pass_reader = i2s_stream_init(&r_cfg);
-    if (!pass_reader) { ESP_LOGE(TAG, "pass reader init failed"); return false; }
-    i2s_set_clk_mono_16k(pass_reader);
-
-    i2s_stream_cfg_t w_cfg = I2S_STREAM_CFG_DEFAULT();
-    w_cfg.type = AUDIO_STREAM_WRITER; w_cfg.task_core = 1; w_cfg.stack_in_ext = true;
-    pass_writer = i2s_stream_init(&w_cfg);
-    if (!pass_writer) { ESP_LOGE(TAG, "pass writer init failed"); audio_element_deinit(pass_reader); pass_reader=NULL; return false; }
-    i2s_set_clk_mono_16k(pass_writer);
-
-    audio_pipeline_cfg_t p_cfg = DEFAULT_AUDIO_PIPELINE_CONFIG();
-    pipe_pass = audio_pipeline_init(&p_cfg);
-    if (!pipe_pass) {
-        ESP_LOGE(TAG, "pass pipeline init failed");
-        audio_element_deinit(pass_reader); pass_reader = NULL;
-        audio_element_deinit(pass_writer); pass_writer = NULL;
-        return false;
-    }
-    ESP_ERROR_CHECK(audio_pipeline_register(pipe_pass, pass_reader, "reader"));
-    ESP_ERROR_CHECK(audio_pipeline_register(pipe_pass, pass_writer, "writer"));
-    const char *links[] = {"reader", "writer"};
-    ESP_ERROR_CHECK(audio_pipeline_link(pipe_pass, links, 2));
-    return true;
+    adc_oneshot_unit_init_cfg_t u = { .unit_id = ADC_UNIT_1 };
+    adc_oneshot_new_unit(&u, &g_adc);
+    adc_oneshot_chan_cfg_t ch = { .bitwidth = ADC_BITWIDTH_12, .atten = ADC_ATTEN_DB_12 };
+    adc_oneshot_config_channel(g_adc, ADC_CHANNEL_3, &ch); // GPIO39
 }
 
-static void start_mode(run_mode_t m)
+static inline void dsp_hal_volume_step(int delta)
 {
-    stop_pipeline(pipe_clean);
-    stop_pipeline(pipe_pass);
-
-    bool ran = false;
-    if (m == MODE_CLEAN && pipe_clean)     { audio_pipeline_run(pipe_clean); ran = true; }
-    else if ((m == MODE_PASSTHROUGH || m == MODE_BF_PLACEHOLDER) && pipe_pass) { audio_pipeline_run(pipe_pass); ran = true; }
-
-    if (!ran && pipe_pass) { ESP_LOGW(TAG, "Mode %d unavailable; fallback to PASS", (int)m); audio_pipeline_run(pipe_pass); m = MODE_PASSTHROUGH; }
-    leds_show_mode(m);
-    ESP_LOGI(TAG, "Mode -> %d (0=pass,1=clean,2=bf)", m);
+    if (!g_hal) return;
+    int v = 80;
+    audio_hal_get_volume(g_hal, &v);
+    v += delta;
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    audio_hal_set_volume(g_hal, v);
+    ESP_LOGI(TAG, "Twolf HAL volume -> %d", v);
 }
 
-// ===== Buttons =====
-static void button_task(void *arg)
+static void buttons_task(void *arg)
 {
-    int stable_count = 0;
-    btn_id_t last = BTN_NONE;
+    btn_t prev_bin = BTN_NONE;     // previous decoded bin (for hysteresis)
+    btn_t last_sent = BTN_NONE;    // last button we emitted
+    int   same_count = 0;
 
     while (1) {
-        int mv = adc_read_avg_mv();
-        btn_id_t cur = decode_button_from_mv(mv);
+        // Median of 7 samples
+        int raw[7];
+        for (int i=0;i<7;++i){ adc_oneshot_read(g_adc, ADC_CHANNEL_3, &raw[i]); vTaskDelay(pdMS_TO_TICKS(2)); }
+        for (int i=0;i<7;++i) for (int j=i+1;j<7;++j) if (raw[j]<raw[i]){ int t=raw[i]; raw[i]=raw[j]; raw[j]=t; }
+        int mv = (raw[3] * 3300) / 4095; // approx mV
 
-        if (cur == last && cur != BTN_NONE) {
-            if (++stable_count >= BTN_STABLE_SAMPLES) {
-                ESP_LOGI(TAG, "Button: %s (%d mV)", kButtons[cur], mv);
-                switch (cur) {
-                    case BTN_VOL_MINUS: hp_volume = (hp_volume >= 5) ? hp_volume - 5 : 0;   apply_volume(); break;
-                    case BTN_VOL_PLUS:  hp_volume = (hp_volume <= 95) ? hp_volume + 5 : 100; apply_volume(); break;
-                    case BTN_MODE:      run_mode = (run_mode + 1) % MODE_MAX; start_mode(run_mode); break;
-                    case BTN_SET:       hp_mute = !hp_mute; apply_volume(); break;
-                    case BTN_REC:       aec_delay_ms -= 10; apply_aec_delay(); break;
-                    case BTN_PLAY:      aec_delay_ms += 10; apply_aec_delay(); break;
-                    default: break;
+        btn_t cur = decode_button_mv_hyst(mv, prev_bin);
+
+        if (cur == prev_bin) same_count++;
+        else                 same_count = 1;
+
+        if (same_count >= DEBOUNCE_MEDS && cur != BTN_NONE && cur != last_sent) {
+            const char *name = (cur==BTN_SET?"SET":cur==BTN_PLAY?"PLAY":cur==BTN_REC?"REC":
+                                cur==BTN_MODE?"MODE":cur==BTN_VOLDN?"VOL-":"VOL+");
+            ESP_LOGI(TAG, "Button: %s (~%dmV)", name, mv);
+
+            leds_flash_all(90);
+            vTaskDelay(pdMS_TO_TICKS(60));
+            leds_flash_all(2);
+
+            if (cur == BTN_PLAY) {
+                g_bridge_on = !g_bridge_on;
+                ESP_LOGW(TAG, "Bridge %s", g_bridge_on ? "ON" : "OFF");
+            } else if (cur == BTN_MODE) {
+                g_mode = (g_mode == MODE_RAW) ? MODE_ENH : (g_mode == MODE_ENH ? MODE_DSP : MODE_RAW);
+                const char *mname = (g_mode==MODE_RAW?"RAW": g_mode==MODE_ENH?"ENHANCED":"DSP");
+                ESP_LOGW(TAG, "Mode -> %s", mname);
+                int blinks = (g_mode==MODE_RAW)?1:(g_mode==MODE_ENH?2:3);
+                for (int i=0;i<blinks;++i){ leds_flash_all(120); vTaskDelay(pdMS_TO_TICKS(80)); leds_flash_all(2); vTaskDelay(pdMS_TO_TICKS(100)); }
+            } else if (cur == BTN_VOLDN) {
+                if (g_mode == MODE_DSP) {
+                    dsp_hal_volume_step(-3);                 // DSP volume (clean)
+                    g_dsp_gain_db -= 0.5f;                   // fine post-gain
+                    if (g_dsp_gain_db < -6.0f) g_dsp_gain_db = -6.0f;
+                    ESP_LOGI(TAG, "DSP post-gain: %.1f dB", g_dsp_gain_db);
+                } else {
+                    g_volume_pct = (g_volume_pct>=5)? g_volume_pct-5 : 0;
+                    ESP_LOGI(TAG, "ENH target Volume=%d%%", g_volume_pct);
                 }
-                // wait release
-                do { vTaskDelay(pdMS_TO_TICKS(BTN_POLL_MS)); mv = adc_read_avg_mv(); }
-                while (decode_button_from_mv(mv) == cur);
-                stable_count = 0; last = BTN_NONE;
+            } else if (cur == BTN_VOLUP) {
+                if (g_mode == MODE_DSP) {
+                    dsp_hal_volume_step(+3);
+                    g_dsp_gain_db += 0.5f;
+                    if (g_dsp_gain_db > 18.0f) g_dsp_gain_db = 18.0f;
+                    ESP_LOGI(TAG, "DSP post-gain: %.1f dB", g_dsp_gain_db);
+                } else {
+                    g_volume_pct = (g_volume_pct<=95)? g_volume_pct+5 : 100;
+                    ESP_LOGI(TAG, "ENH target Volume=%d%%", g_volume_pct);
+                }
+            } else if (cur == BTN_SET) {
+                if (g_mode == MODE_DSP) {
+                    g_dsp_bright_on = !g_dsp_bright_on;
+                    ESP_LOGW(TAG, "DSP BRIGHT: %s", g_dsp_bright_on ? "ON" : "OFF");
+                    for (int i=0;i<3;++i){ leds_flash_all(120); vTaskDelay(pdMS_TO_TICKS(60)); leds_flash_all(2); vTaskDelay(pdMS_TO_TICKS(80)); }
+                }
             }
-        } else {
-            stable_count = (cur == BTN_NONE) ? 0 : 1;
-            last = cur;
+
+            last_sent = cur;
         }
-        vTaskDelay(pdMS_TO_TICKS(BTN_POLL_MS));
+
+        prev_bin = cur;
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
-// ===== app_main =====
+// =====================================================================
+//                        Simple Enhance (HPF + AGC + limiter)
+// =====================================================================
+typedef struct {
+    float b0,b1,b2,a1,a2;   // biquad
+    float z1L,z2L,z1R,z2R;
+    float agc_gain;
+} proc_t;
+
+static proc_t g_proc;
+
+static void proc_init(proc_t *p)
+{
+    memset(p, 0, sizeof(*p));
+    const float fs=48000.f, fc=120.f, Q=0.7071f;
+    const float w0 = 2.f*(float)M_PI*fc/fs;
+    const float c = cosf(w0), s = sinf(w0), alpha = s/(2.f*Q);
+    const float a0 = 1.f + alpha;
+
+    const float b0 =  (1.f + c)*0.5f;
+    const float b1 = -(1.f + c);
+    const float b2 =  (1.f + c)*0.5f;
+    const float a1 =  -2.f * c;
+    const float a2 =   1.f - alpha;
+
+    p->b0 = b0/a0; p->b1 = b1/a0; p->b2 = b2/a0;
+    p->a1 = a1/a0; p->a2 = a2/a0;
+    p->agc_gain = 1.0f;
+}
+
+static inline float soft_clip(float x)
+{
+    const float t = 0.95f;
+    if (x >  t) return t + (x - t) * 0.1f;
+    if (x < -t) return -t + (x + t) * 0.1f;
+    return x;
+}
+
+static inline int16_t clamp16_from_float(float v)
+{
+    int32_t s = (int32_t)(v * 32767.f);
+    if (s >  32767) s =  32767;
+    if (s < -32768) s = -32768;
+    return (int16_t)s;
+}
+
+static void process_block(proc_t *p, int16_t *buf, size_t frames, float target_rms)
+{
+    double acc = 0.0;
+    for (size_t n=0;n<frames;++n) {
+        float xL = (float)buf[2*n+0] * (1.0f/32768.f);
+        float xR = (float)buf[2*n+1] * (1.0f/32768.f);
+        float yL = p->b0*xL + p->z1L;
+        p->z1L = p->b1*xL + p->z2L - p->a1*yL;
+        p->z2L = p->b2*xL           - p->a2*yL;
+        float yR = p->b0*xR + p->z1R;
+        p->z1R = p->b1*xR + p->z2R - p->a1*yR;
+        p->z2R = p->b2*xR           - p->a2*yR;
+        acc += (double)yL*yL + (double)yR*yR;
+        buf[2*n+0] = clamp16_from_float(yL);
+        buf[2*n+1] = clamp16_from_float(yR);
+    }
+
+    float rms = sqrtf((float)(acc / (frames*2)));
+    float g_des = (rms > 1e-6f) ? (target_rms / rms) : 4.0f;
+    if (g_des < 0.5f) g_des = 0.5f;
+    if (g_des > 8.0f) g_des = 8.0f;
+    const float a_up = 0.30f, a_dn = 0.08f;
+    float alpha = (g_des > p->agc_gain) ? a_up : a_dn;
+    p->agc_gain = p->agc_gain + alpha * (g_des - p->agc_gain);
+
+    for (size_t n=0;n<frames;++n) {
+        float yL = (float)buf[2*n+0] * (1.0f/32768.f) * p->agc_gain;
+        float yR = (float)buf[2*n+1] * (1.0f/32768.f) * p->agc_gain;
+        yL = soft_clip(yL);
+        yR = soft_clip(yR);
+        buf[2*n+0] = clamp16_from_float(yL);
+        buf[2*n+1] = clamp16_from_float(yR);
+    }
+}
+
+// =====================================================================
+//                        DSP post-processing (gain + bright tilt + limiter)
+// =====================================================================
+typedef struct { float lpL, lpR; } dsp_post_t;
+static dsp_post_t g_post;
+
+static inline void dsp_post_init(void) { memset(&g_post, 0, sizeof(g_post)); }
+
+static inline void dsp_post_process(int16_t *buf, size_t frames, float gain_db, bool bright_on)
+{
+    const float lin = powf(10.0f, gain_db / 20.0f);
+    const float alpha = 1.0f - expf(-2.0f * (float)M_PI * 2000.0f / (float)SAMPLE_RATE_HZ);
+    const float bright_k = bright_on ? 0.35f : 0.0f;
+
+    for (size_t n=0; n<frames; ++n) {
+        float xL = (float)buf[2*n+0] * (1.0f/32768.0f);
+        g_post.lpL += alpha * (xL - g_post.lpL);
+        float yL = (xL + bright_k * (xL - g_post.lpL)) * lin;
+        yL = soft_clip(yL);
+        buf[2*n+0] = clamp16_from_float(yL);
+
+        float xR = (float)buf[2*n+1] * (1.0f/32768.0f);
+        g_post.lpR += alpha * (xR - g_post.lpR);
+        float yR = (xR + bright_k * (xR - g_post.lpR)) * lin;
+        yR = soft_clip(yR);
+        buf[2*n+1] = clamp16_from_float(yR);
+    }
+}
+
+// =====================================================================
+//                        Startup Tone (smooth)
+// =====================================================================
+static void tone_task(void *arg)
+{
+    const float freq = 880.0f;
+    const int   N    = 256;
+    const int   total_frames = (SAMPLE_RATE_HZ * TONE_MS) / 1000;
+    int16_t *buf = (int16_t*)heap_caps_malloc(N*2*sizeof(int16_t), MALLOC_CAP_8BIT);
+    if (!buf){ vTaskDelete(NULL); return; }
+
+    static float phase = 0.f;
+    const float dphi = 2.f*(float)M_PI*freq / (float)SAMPLE_RATE_HZ;
+    const int fade_frames = (SAMPLE_RATE_HZ * 12) / 1000;
+
+    int generated = 0;
+    ESP_LOGI(TAG, "Startup tone ~%d ms", TONE_MS);
+    while (generated < total_frames) {
+        int frames = (total_frames - generated) > N ? N : (total_frames - generated);
+        for (int i=0;i<frames;++i) {
+            float env = 1.0f;
+            if (generated < fade_frames) env = (float)generated / (float)fade_frames;
+            else if (generated > total_frames - fade_frames) env = (float)(total_frames - generated) / (float)fade_frames;
+
+            float s = sinf(phase) * env;
+            phase += dphi; if (phase > 2.f*(float)M_PI) phase -= 2.f*(float)M_PI;
+
+            float amp = (g_volume_pct/100.0f) * 0.95f;
+            int16_t v = clamp16_from_float(s * amp);
+            buf[2*i+0] = v; buf[2*i+1] = v;
+            generated++;
+        }
+        size_t wrote=0;
+        i2s_channel_write(g_tx, buf, frames*2*sizeof(int16_t), &wrote, pdMS_TO_TICKS(50));
+    }
+    free(buf);
+    vTaskDelete(NULL);
+}
+
+// =====================================================================
+//                        Bridge (RAW / ENH / DSP)
+// =====================================================================
+static void bridge_task(void *arg)
+{
+    const size_t N = 256; // frames per chunk
+    int16_t *buf = (int16_t*)heap_caps_malloc(N*2*sizeof(int16_t), MALLOC_CAP_8BIT);
+    if (!buf){ vTaskDelete(NULL); return; }
+
+    proc_init(&g_proc);
+    dsp_post_init();
+    ESP_LOGI(TAG, "Bridge ready. PLAY toggles audio; MODE cycles RAW/ENH/DSP. SET toggles BRIGHT in DSP.");
+
+    while (1) {
+        if (!g_bridge_on) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
+
+        size_t got=0, put=0;
+        if (i2s_channel_read(g_rx, buf, N*2*sizeof(int16_t), &got, pdMS_TO_TICKS(50)) == ESP_OK && got) {
+            if (g_mode == MODE_ENH) {
+                float target = 0.22f + (g_volume_pct/100.0f) * 0.23f; // ~ -13..-7 dBFS
+                process_block(&g_proc, buf, got/(2*sizeof(int16_t)), target);
+            } else if (g_mode == MODE_DSP) {
+                dsp_post_process(buf, got/(2*sizeof(int16_t)), g_dsp_gain_db, g_dsp_bright_on);
+            }
+            (void)i2s_channel_write(g_tx, buf, got, &put, pdMS_TO_TICKS(50));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+    }
+}
+
+// =====================================================================
+//                        Optional control image loader (stub)
+// =====================================================================
+static inline void twolf_try_load_control_image(void) { /* enable later if you embed a .srec */ }
+
+
+    /* START SOLUTION */
+    gpio_set_level(21, 1);  
+    gpio_set_level(22, 0);  
+    gpio_set_level(21, 0);
+    gpio_set_level(22, 1);
+    /* STOP SOLUTION */
+
+// =====================================================================
+//                        app_main
+// =====================================================================
 void app_main(void)
 {
-    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_LOGI(TAG, "Application start");
 
     leds_init();
-    leds_show_mode(run_mode);
+    xTaskCreate(leds_task, "leds", 2048, NULL, 3, NULL);
 
-    board = audio_board_init();
-    AUDIO_NULL_CHECK(TAG, board, return);
-    audio_hal_ctrl_codec(board->audio_hal, AUDIO_HAL_CODEC_MODE_BOTH, AUDIO_HAL_CTRL_START);
-    hp_volume = E_AUDIO_VOL_HP_DEFAULT;
-    apply_volume();
+    rails_init();
+    ESP_ERROR_CHECK(i2s_open_master());
 
-    adc_init_buttons();
-    xTaskCreate(button_task, "button_task", 4096, NULL, 5, NULL);
+    // ---- Twolf (ZL38063) HAL bring-up for older audio_hal API ----
+    audio_hal_codec_config_t hal_cfg = {0};
+    hal_cfg.codec_mode = AUDIO_HAL_CODEC_MODE_BOTH;
+    hal_cfg.adc_input  = AUDIO_HAL_ADC_INPUT_ALL;
+    hal_cfg.dac_output = AUDIO_HAL_DAC_OUTPUT_ALL;
+    // Twolf is I2S SLAVE; ESP32 is MASTER @ 48k/16
+    hal_cfg.i2s_iface.mode    = AUDIO_HAL_MODE_SLAVE;
+    hal_cfg.i2s_iface.fmt     = AUDIO_HAL_I2S_NORMAL;
+    hal_cfg.i2s_iface.samples = AUDIO_HAL_48K_SAMPLES;
+    hal_cfg.i2s_iface.bits    = AUDIO_HAL_BIT_LENGTH_16BITS;
 
-    bool have_clean = build_pipeline_clean();
-    if (!have_clean && run_mode == MODE_CLEAN) run_mode = MODE_PASSTHROUGH;
-    bool have_pass  = build_pipeline_pass();
-    if (!have_pass) { ESP_LOGE(TAG, "PASS pipeline missing; nothing to run!"); while (1) vTaskDelay(pdMS_TO_TICKS(1000)); }
+    g_hal = audio_hal_init(&hal_cfg, &AUDIO_CODEC_ZL38063_DEFAULT_HANDLE);
+    if (g_hal) {
+        audio_hal_ctrl_codec(g_hal, AUDIO_HAL_CODEC_MODE_BOTH, AUDIO_HAL_CTRL_START);
+        audio_hal_set_mute(g_hal, false);
+        audio_hal_set_volume(g_hal, 90);   // loud, clean starting point
+        ESP_LOGI(TAG, "Twolf HAL started, volume=90");
+        twolf_try_load_control_image();    // (no-op for now)
+    } else {
+        ESP_LOGW(TAG, "Twolf HAL init failed (volume control unavailable)");
+    }
 
-    start_mode(run_mode);
+    buttons_init();
+    xTaskCreate(buttons_task, "buttons", 3072, NULL, 4, NULL);
 
-    while (true) vTaskDelay(pdMS_TO_TICKS(1000));
+    xTaskCreate(tone_task,   "tone",   3072, NULL, 5, NULL);
+    xTaskCreate(bridge_task, "bridge", 4096, NULL, 5, NULL);
+
+    ESP_LOGI(TAG, "Ready. PLAY=bridge, MODE cycles RAW/ENH/DSP; VOL± controls ENH/DSP; SET toggles BRIGHT in DSP.");
 }
