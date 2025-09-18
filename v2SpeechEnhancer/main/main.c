@@ -11,6 +11,8 @@
 //   idf_component_register(SRCS "main.c" INCLUDE_DIRS "." REQUIRES audio_hal esp_peripherals driver esp_driver_i2s)
 
 #include <math.h>
+#include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -21,6 +23,7 @@
 #include "esp_err.h"
 
 #include "driver/gpio.h"
+#include "driver/i2c.h"
 #include "driver/i2s_std.h"
 #include "esp_heap_caps.h"
 
@@ -487,7 +490,347 @@ static void bridge_task(void *arg)
 // =====================================================================
 //                        Optional control image loader (stub)
 // =====================================================================
-static inline void twolf_try_load_control_image(void) { /* enable later if you embed a .srec */ }
+extern const uint8_t twolf_control_srec_start[] asm("_binary_twolf_control_srec_start");
+extern const uint8_t twolf_control_srec_end[]   asm("_binary_twolf_control_srec_end");
+
+#define TWOLF_I2C_PORT      I2C_NUM_0
+#define TWOLF_I2C_SDA       GPIO_NUM_18
+#define TWOLF_I2C_SCL       GPIO_NUM_23
+#define TWOLF_I2C_HZ        400000
+#define TWOLF_WRITE_TIMEOUT pdMS_TO_TICKS(20)
+#define TWOLF_MAX_BURST     16
+
+static bool     s_twolf_i2c_ready = false;
+static uint8_t  s_twolf_i2c_addr  = 0;   // 7-bit address
+
+static inline int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+static bool parse_hex_byte(const char *s, uint8_t *out)
+{
+    int hi = hex_nibble(s[0]);
+    int lo = hex_nibble(s[1]);
+    if (hi < 0 || lo < 0) return false;
+    *out = (uint8_t)((hi << 4) | lo);
+    return true;
+}
+
+static bool parse_hex_word(const char *s, uint16_t *out)
+{
+    uint8_t hi, lo;
+    if (!parse_hex_byte(s, &hi) || !parse_hex_byte(s + 2, &lo)) return false;
+    *out = (uint16_t)((hi << 8) | lo);
+    return true;
+}
+
+static esp_err_t twolf_i2c_init_once(void)
+{
+    if (s_twolf_i2c_ready) {
+        return ESP_OK;
+    }
+
+    i2c_config_t cfg = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = TWOLF_I2C_SDA,
+        .scl_io_num = TWOLF_I2C_SCL,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = TWOLF_I2C_HZ,
+    };
+
+    esp_err_t err = i2c_param_config(TWOLF_I2C_PORT, &cfg);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = i2c_driver_install(TWOLF_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0);
+    if (err == ESP_ERR_INVALID_STATE) {
+        err = ESP_OK;
+    }
+    if (err == ESP_OK) {
+        s_twolf_i2c_ready = true;
+    }
+    return err;
+}
+
+static esp_err_t twolf_send_words(const uint16_t *words, size_t count)
+{
+    if (!s_twolf_i2c_addr || !count) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint8_t buf[2 * (TWOLF_MAX_BURST + 1)];
+    if (count > (TWOLF_MAX_BURST + 1)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        buf[2 * i + 0] = (uint8_t)(words[i] >> 8);
+        buf[2 * i + 1] = (uint8_t)(words[i] & 0xFF);
+    }
+    return i2c_master_write_to_device(TWOLF_I2C_PORT, s_twolf_i2c_addr,
+                                      buf, count * 2, TWOLF_WRITE_TIMEOUT);
+}
+
+static esp_err_t twolf_send_command(uint16_t cmd)
+{
+    return twolf_send_words(&cmd, 1);
+}
+
+static esp_err_t twolf_hbi_write(uint16_t addr, const uint16_t *vals, size_t words)
+{
+    if (!words) {
+        return ESP_OK;
+    }
+
+    uint8_t page = (uint8_t)(addr >> 8);
+    uint8_t offset = (uint8_t)((addr & 0xFFu) / 2u);
+    esp_err_t err;
+
+    if (page == 0) {
+        uint16_t cmd = (uint16_t)(0x8000u | ((uint16_t)offset << 8) | (uint16_t)(words - 1));
+        uint16_t temp[TWOLF_MAX_BURST + 1];
+        if (words > TWOLF_MAX_BURST) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        temp[0] = cmd | 0x0080u;  // direct write
+        memcpy(&temp[1], vals, words * sizeof(uint16_t));
+        return twolf_send_words(temp, words + 1);
+    }
+
+    uint16_t command_buf[2];
+    if (page != 0xFF) {
+        page = (uint8_t)(page - 1);
+    }
+    command_buf[0] = (uint16_t)(0xFE00u | page);  // select page
+    uint16_t write_cmd = (uint16_t)(((uint16_t)offset << 8) | (uint16_t)(words - 1));
+    command_buf[1] = (uint16_t)(write_cmd | 0x0080u);
+
+    if (words > TWOLF_MAX_BURST) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = twolf_send_words(command_buf, 1);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    uint16_t payload[TWOLF_MAX_BURST + 1];
+    payload[0] = command_buf[1];
+    memcpy(&payload[1], vals, words * sizeof(uint16_t));
+    return twolf_send_words(payload, words + 1);
+}
+
+static esp_err_t twolf_hbi_read(uint16_t addr, uint16_t *vals, size_t words)
+{
+    if (!words) {
+        return ESP_OK;
+    }
+
+    uint8_t page = (uint8_t)(addr >> 8);
+    uint8_t offset = (uint8_t)((addr & 0xFFu) / 2u);
+    uint16_t cmd;
+    esp_err_t err;
+
+    if (page == 0) {
+        cmd = (uint16_t)(0x8000u | ((uint16_t)offset << 8) | (uint16_t)(words - 1));
+    } else {
+        if (page != 0xFF) {
+            page = (uint8_t)(page - 1);
+        }
+        err = twolf_send_command((uint16_t)(0xFE00u | page));
+        if (err != ESP_OK) {
+            return err;
+        }
+        cmd = (uint16_t)(((uint16_t)offset << 8) | (uint16_t)(words - 1));
+    }
+
+    uint8_t cmd_bytes[2] = { (uint8_t)(cmd >> 8), (uint8_t)(cmd & 0xFF) };
+    size_t read_len = words * 2;
+    uint8_t data[2 * TWOLF_MAX_BURST];
+    if (words > TWOLF_MAX_BURST) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = i2c_master_write_read_device(TWOLF_I2C_PORT, s_twolf_i2c_addr,
+                                       cmd_bytes, sizeof(cmd_bytes),
+                                       data, read_len, TWOLF_WRITE_TIMEOUT);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    for (size_t i = 0; i < words; ++i) {
+        vals[i] = (uint16_t)((data[2 * i] << 8) | data[2 * i + 1]);
+    }
+    return ESP_OK;
+}
+
+static esp_err_t twolf_detect_address(void)
+{
+    if (s_twolf_i2c_addr) {
+        return ESP_OK;
+    }
+    static const uint8_t candidates[] = { 0x45, 0x52 };
+    for (size_t i = 0; i < sizeof(candidates); ++i) {
+        s_twolf_i2c_addr = candidates[i];
+        esp_err_t err = twolf_send_command(0xFFFFu);  // HBI_NO_OP
+        if (err == ESP_OK) {
+            return ESP_OK;
+        }
+    }
+    s_twolf_i2c_addr = 0;
+    return ESP_ERR_NOT_FOUND;
+}
+
+static inline void twolf_try_load_control_image(void)
+{
+    if (twolf_i2c_init_once() != ESP_OK) {
+        ESP_LOGW(TAG, "Twolf I2C init failed; skipping control image");
+        return;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    if (twolf_detect_address() != ESP_OK) {
+        ESP_LOGW(TAG, "Twolf I2C address not found; control image not loaded");
+        return;
+    }
+
+    size_t len = (size_t)(twolf_control_srec_end - twolf_control_srec_start);
+    char *text = malloc(len + 1);
+    if (!text) {
+        ESP_LOGW(TAG, "Out of memory parsing Twolf control image");
+        return;
+    }
+    memcpy(text, twolf_control_srec_start, len);
+    text[len] = '\0';
+
+    uint16_t batch_addr = 0;
+    uint16_t batch_vals[TWOLF_MAX_BURST];
+    size_t   batch_count = 0;
+    uint16_t prev_addr = 0;
+    bool     have_batch = false;
+    size_t   records = 0;
+    size_t   failures = 0;
+
+    char *saveptr = NULL;
+    for (char *line = strtok_r(text, "\r\n", &saveptr);
+         line != NULL;
+         line = strtok_r(NULL, "\r\n", &saveptr)) {
+        while (*line == ' ' || *line == '\t') { ++line; }
+        if (*line == '\0' || *line == ';') {
+            continue;
+        }
+        if (!(line[0] == 'S' && line[1] == '1')) {
+            continue;
+        }
+
+        uint8_t count;
+        uint16_t addr;
+        uint16_t value;
+        uint8_t checksum;
+
+        if (!parse_hex_byte(line + 2, &count) ||
+            !parse_hex_word(line + 4, &addr) ||
+            !parse_hex_word(line + 8, &value) ||
+            !parse_hex_byte(line + 12, &checksum)) {
+            ESP_LOGW(TAG, "Malformed S1 record: %s", line);
+            continue;
+        }
+
+        uint32_t sum = count + ((addr >> 8) & 0xFF) + (addr & 0xFF) + ((value >> 8) & 0xFF) + (value & 0xFF);
+        uint8_t expected = (uint8_t)(~sum);
+        if (checksum != expected) {
+            ESP_LOGW(TAG, "Checksum mismatch for 0x%04x", addr);
+            continue;
+        }
+
+        if (!have_batch) {
+            batch_addr = addr;
+            batch_vals[0] = value;
+            batch_count = 1;
+            prev_addr = addr;
+            have_batch = true;
+        } else if ((uint16_t)(prev_addr + 2) == addr && batch_count < TWOLF_MAX_BURST) {
+            batch_vals[batch_count++] = value;
+            prev_addr = addr;
+        } else {
+            esp_err_t err = twolf_hbi_write(batch_addr, batch_vals, batch_count);
+            if (err != ESP_OK) {
+                ++failures;
+                ESP_LOGW(TAG, "Twolf write 0x%04x (%u words) failed: %d", batch_addr, (unsigned)batch_count, err);
+            }
+            records += batch_count;
+            batch_addr = addr;
+            batch_vals[0] = value;
+            batch_count = 1;
+            prev_addr = addr;
+        }
+    }
+
+    if (have_batch) {
+        esp_err_t err = twolf_hbi_write(batch_addr, batch_vals, batch_count);
+        if (err != ESP_OK) {
+            ++failures;
+            ESP_LOGW(TAG, "Twolf write 0x%04x (%u words) failed: %d", batch_addr, (unsigned)batch_count, err);
+        }
+        records += batch_count;
+    }
+
+    free(text);
+
+    if (records) {
+        ESP_LOGI(TAG, "Twolf control image applied (%u registers, %u failures)", (unsigned)records, (unsigned)failures);
+    }
+
+    typedef struct {
+        uint16_t    addr;
+        uint16_t    expected;
+        const char *desc;
+    } twolf_verify_reg_t;
+
+    static const twolf_verify_reg_t verify_regs[] = {
+        { 0x0282, 0x0002, "DMIC slot 0 source (MIC2)" },
+        { 0x0284, 0x0004, "DMIC slot 1 source (MIC4)" },
+        { 0x0286, 0x0006, "DMIC slot 2 source (MIC6)" },
+        { 0x0328, 0x3040, "Beamformer routed to downstream tap" },
+        { 0x032A, 0x010C, "Downstream tap feeding limiter" },
+        { 0x0338, 0x4801, "Headphone DAC crosspoint enabled" },
+        { 0x03A4, 0x0002, "PLL M1 (48 kHz base)" },
+        { 0x03A6, 0x0064, "PLL M2 (48 kHz base)" },
+        { 0x03A8, 0x01F4, "PLL fractional divider (48 kHz)" },
+        { 0x03B8, 0x00C2, "I2S SDOUT trim" },
+    };
+
+    bool config_ok = true;
+    for (size_t i = 0; i < sizeof(verify_regs) / sizeof(verify_regs[0]); ++i) {
+        uint16_t value = 0;
+        const twolf_verify_reg_t *reg = &verify_regs[i];
+        if (twolf_hbi_read(reg->addr, &value, 1) != ESP_OK) {
+            ESP_LOGW(TAG, "Twolf readback failed for 0x%04x (%s)", reg->addr, reg->desc);
+            config_ok = false;
+            continue;
+        }
+        if (value != reg->expected) {
+            ESP_LOGW(TAG, "Twolf %s mismatch: 0x%04x (expected 0x%04x)",
+                     reg->desc, value, reg->expected);
+            config_ok = false;
+        } else {
+            ESP_LOGI(TAG, "Twolf %s = 0x%04x", reg->desc, value);
+        }
+    }
+
+    if (config_ok) {
+        ESP_LOGI(TAG, "Twolf control image verified: DMIC beamformer, downstream path, and PLL configured for 48 kHz playback.");
+    } else {
+        ESP_LOGW(TAG, "Twolf control image verification found mismatches; see logs above.");
+    }
+}
 
 
     /* START SOLUTION */
@@ -508,6 +851,7 @@ void app_main(void)
     xTaskCreate(leds_task, "leds", 2048, NULL, 3, NULL);
 
     rails_init();
+    twolf_try_load_control_image();
     ESP_ERROR_CHECK(i2s_open_master());
 
     // ---- Twolf (ZL38063) HAL bring-up for older audio_hal API ----
@@ -527,7 +871,6 @@ void app_main(void)
         audio_hal_set_mute(g_hal, false);
         audio_hal_set_volume(g_hal, 90);   // loud, clean starting point
         ESP_LOGI(TAG, "Twolf HAL started, volume=90");
-        twolf_try_load_control_image();    // (no-op for now)
     } else {
         ESP_LOGW(TAG, "Twolf HAL init failed (volume control unavailable)");
     }
