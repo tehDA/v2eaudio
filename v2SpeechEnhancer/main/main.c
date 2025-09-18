@@ -831,15 +831,6 @@ static inline void twolf_try_load_control_image(void)
         ESP_LOGW(TAG, "Twolf control image verification found mismatches; see logs above.");
     }
 }
-
-
-    /* START SOLUTION */
-    gpio_set_level(21, 1);  
-    gpio_set_level(22, 0);  
-    gpio_set_level(21, 0);
-    gpio_set_level(22, 1);
-    /* STOP SOLUTION */
-
 // =====================================================================
 //                        app_main
 // =====================================================================
@@ -868,11 +859,18 @@ void app_main(void)
     g_hal = audio_hal_init(&hal_cfg, &AUDIO_CODEC_ZL38063_DEFAULT_HANDLE);
     if (g_hal) {
         audio_hal_ctrl_codec(g_hal, AUDIO_HAL_CODEC_MODE_BOTH, AUDIO_HAL_CTRL_START);
-        audio_hal_set_mute(g_hal, false);
-        audio_hal_set_volume(g_hal, 90);   // loud, clean starting point
-        ESP_LOGI(TAG, "Twolf HAL started, volume=90");
+        ESP_LOGI(TAG, "Twolf HAL started (codec running, waiting for control image)");
+
     } else {
         ESP_LOGW(TAG, "Twolf HAL init failed (volume control unavailable)");
+    }
+
+    twolf_try_load_control_image();
+
+    if (g_hal) {
+        audio_hal_set_volume(g_hal, 90);   // loud, clean starting point
+        audio_hal_set_mute(g_hal, false);
+        ESP_LOGI(TAG, "Twolf HAL volume restored after control image load");
     }
 
     buttons_init();
