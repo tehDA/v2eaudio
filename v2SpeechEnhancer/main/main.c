@@ -842,6 +842,7 @@ void app_main(void)
     xTaskCreate(leds_task, "leds", 2048, NULL, 3, NULL);
 
     rails_init();
+    twolf_try_load_control_image();
     ESP_ERROR_CHECK(i2s_open_master());
 
     // ---- Twolf (ZL38063) HAL bring-up for older audio_hal API ----
@@ -859,6 +860,7 @@ void app_main(void)
     if (g_hal) {
         audio_hal_ctrl_codec(g_hal, AUDIO_HAL_CODEC_MODE_BOTH, AUDIO_HAL_CTRL_START);
         ESP_LOGI(TAG, "Twolf HAL started (codec running, waiting for control image)");
+
     } else {
         ESP_LOGW(TAG, "Twolf HAL init failed (volume control unavailable)");
     }
