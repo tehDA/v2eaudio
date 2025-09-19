@@ -23,7 +23,7 @@
 #include "esp_err.h"
 
 #include "driver/gpio.h"
-#include "esp_driver/i2c_master.h"
+#include "driver/i2c_master.h"
 #include "driver/i2s_std.h"
 #include "esp_heap_caps.h"
 #include "soc/clk_tree_defs.h"
