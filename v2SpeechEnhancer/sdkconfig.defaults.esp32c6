@@ -2,3 +2,6 @@
 # Audio HAL
 #
 CONFIG_ESP32_C6_DEVKIT_BOARD=y
+
+# ========= I2C driver (esp_driver_i2c) =========
+CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK=y

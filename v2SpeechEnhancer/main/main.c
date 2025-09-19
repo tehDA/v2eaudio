@@ -23,9 +23,10 @@
 #include "esp_err.h"
 
 #include "driver/gpio.h"
-#include "driver/i2c.h"
+#include "esp_driver/i2c_master.h"
 #include "driver/i2s_std.h"
 #include "esp_heap_caps.h"
+#include "soc/clk_tree_defs.h"
 
 #include "esp_adc/adc_oneshot.h"   // modern ADC API
 
@@ -497,11 +498,13 @@ extern const uint8_t twolf_control_srec_end[]   asm("_binary_twolf_control_srec_
 #define TWOLF_I2C_SDA       GPIO_NUM_18
 #define TWOLF_I2C_SCL       GPIO_NUM_23
 #define TWOLF_I2C_HZ        400000
-#define TWOLF_WRITE_TIMEOUT pdMS_TO_TICKS(20)
+#define TWOLF_WRITE_TIMEOUT_MS 20
 #define TWOLF_MAX_BURST     16
 
-static bool     s_twolf_i2c_ready = false;
-static uint8_t  s_twolf_i2c_addr  = 0;   // 7-bit address
+static bool                      s_twolf_i2c_ready = false;
+static uint8_t                   s_twolf_i2c_addr  = 0;   // 7-bit address
+static i2c_master_bus_handle_t   s_twolf_bus       = NULL;
+static i2c_master_dev_handle_t   s_twolf_dev       = NULL;
 
 static inline int hex_nibble(char c)
 {
@@ -534,24 +537,20 @@ static esp_err_t twolf_i2c_init_once(void)
         return ESP_OK;
     }
 
-    i2c_config_t cfg = {
-        .mode = I2C_MODE_MASTER,
+    i2c_master_bus_config_t cfg = {
+        .i2c_port = TWOLF_I2C_PORT,
         .sda_io_num = TWOLF_I2C_SDA,
         .scl_io_num = TWOLF_I2C_SCL,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = TWOLF_I2C_HZ,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .intr_priority = 0,
+        .trans_queue_depth = 0,
+        .flags = {
+            .enable_internal_pullup = true,
+        },
     };
 
-    esp_err_t err = i2c_param_config(TWOLF_I2C_PORT, &cfg);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    err = i2c_driver_install(TWOLF_I2C_PORT, I2C_MODE_MASTER, 0, 0, 0);
-    if (err == ESP_ERR_INVALID_STATE) {
-        err = ESP_OK;
-    }
+    esp_err_t err = i2c_new_master_bus(&cfg, &s_twolf_bus);
     if (err == ESP_OK) {
         s_twolf_i2c_ready = true;
     }
@@ -560,7 +559,7 @@ static esp_err_t twolf_i2c_init_once(void)
 
 static esp_err_t twolf_send_words(const uint16_t *words, size_t count)
 {
-    if (!s_twolf_i2c_addr || !count) {
+    if (!s_twolf_dev || !count) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -573,13 +572,51 @@ static esp_err_t twolf_send_words(const uint16_t *words, size_t count)
         buf[2 * i + 0] = (uint8_t)(words[i] >> 8);
         buf[2 * i + 1] = (uint8_t)(words[i] & 0xFF);
     }
-    return i2c_master_write_to_device(TWOLF_I2C_PORT, s_twolf_i2c_addr,
-                                      buf, count * 2, TWOLF_WRITE_TIMEOUT);
+    return i2c_master_transmit(s_twolf_dev, buf, count * 2, TWOLF_WRITE_TIMEOUT_MS);
 }
 
 static esp_err_t twolf_send_command(uint16_t cmd)
 {
     return twolf_send_words(&cmd, 1);
+}
+
+static void twolf_release_device(void)
+{
+    if (s_twolf_dev) {
+        i2c_master_bus_rm_device(s_twolf_dev);
+        s_twolf_dev = NULL;
+    }
+    s_twolf_i2c_addr = 0;
+}
+
+static esp_err_t twolf_create_device(uint8_t addr)
+{
+    if (!s_twolf_bus) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (s_twolf_dev && s_twolf_i2c_addr == addr) {
+        return ESP_OK;
+    }
+
+    if (s_twolf_dev) {
+        twolf_release_device();
+    }
+
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = addr,
+        .scl_speed_hz = TWOLF_I2C_HZ,
+        .scl_wait_us = 0,
+        .flags = {
+            .disable_ack_check = 0,
+        },
+    };
+    esp_err_t err = i2c_master_bus_add_device(s_twolf_bus, &dev_cfg, &s_twolf_dev);
+    if (err == ESP_OK) {
+        s_twolf_i2c_addr = addr;
+    }
+    return err;
 }
 
 static esp_err_t twolf_hbi_write(uint16_t addr, const uint16_t *vals, size_t words)
@@ -632,6 +669,10 @@ static esp_err_t twolf_hbi_read(uint16_t addr, uint16_t *vals, size_t words)
         return ESP_OK;
     }
 
+    if (!s_twolf_dev) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     uint8_t page = (uint8_t)(addr >> 8);
     uint8_t offset = (uint8_t)((addr & 0xFFu) / 2u);
     uint16_t cmd;
@@ -657,9 +698,8 @@ static esp_err_t twolf_hbi_read(uint16_t addr, uint16_t *vals, size_t words)
         return ESP_ERR_INVALID_ARG;
     }
 
-    err = i2c_master_write_read_device(TWOLF_I2C_PORT, s_twolf_i2c_addr,
-                                       cmd_bytes, sizeof(cmd_bytes),
-                                       data, read_len, TWOLF_WRITE_TIMEOUT);
+    err = i2c_master_transmit_receive(s_twolf_dev, cmd_bytes, sizeof(cmd_bytes),
+                                      data, read_len, TWOLF_WRITE_TIMEOUT_MS);
     if (err != ESP_OK) {
         return err;
     }
@@ -672,18 +712,21 @@ static esp_err_t twolf_hbi_read(uint16_t addr, uint16_t *vals, size_t words)
 
 static esp_err_t twolf_detect_address(void)
 {
-    if (s_twolf_i2c_addr) {
+    if (s_twolf_dev) {
         return ESP_OK;
     }
     static const uint8_t candidates[] = { 0x45, 0x52 };
-    for (size_t i = 0; i < sizeof(candidates); ++i) {
-        s_twolf_i2c_addr = candidates[i];
-        esp_err_t err = twolf_send_command(0xFFFFu);  // HBI_NO_OP
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+        esp_err_t err = twolf_create_device(candidates[i]);
+        if (err != ESP_OK) {
+            continue;
+        }
+        err = twolf_send_command(0xFFFFu);  // HBI_NO_OP
         if (err == ESP_OK) {
             return ESP_OK;
         }
+        twolf_release_device();
     }
-    s_twolf_i2c_addr = 0;
     return ESP_ERR_NOT_FOUND;
 }
 
