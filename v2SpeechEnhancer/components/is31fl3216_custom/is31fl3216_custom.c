@@ -1,5 +1,5 @@
 #include "is31fl3216_custom.h"
-#include "esp_driver/i2c_master.h"
+#include "driver/i2c_master.h"
 #include "esp_log.h"
 #include "esp_check.h"
 #include <string.h>   // for memcpy
