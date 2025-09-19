@@ -8,3 +8,6 @@ CONFIG_IDF_FIRMWARE_CHIP_ID=0x0009
 # Audio HAL
 #
 CONFIG_ESP32_S3_KORVO2_V3_BOARD=y
+
+# ========= I2C driver (esp_driver_i2c) =========
+CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK=y

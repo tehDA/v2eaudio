@@ -8,3 +8,6 @@ CONFIG_IDF_FIRMWARE_CHIP_ID=0x0000
 # Audio HAL
 #
 #CONFIG_ESP_LYRAT_V4_3_BOARD=y
+
+# ========= I2C driver (esp_driver_i2c) =========
+CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK=y

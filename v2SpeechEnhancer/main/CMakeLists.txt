@@ -8,6 +8,7 @@ idf_component_register(
         audio_stream
         audio_hal
         esp_peripherals
+        esp_driver_i2c
         audio_board
         esp-adf-libs
         esp_common
