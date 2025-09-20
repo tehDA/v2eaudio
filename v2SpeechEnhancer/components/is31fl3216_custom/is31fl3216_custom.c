@@ -2,6 +2,8 @@
 #include "driver/i2c_master.h"
 #include "esp_log.h"
 #include "esp_check.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>   // for memcpy
 #include <inttypes.h> // for PRIu32 in logging
 #include "soc/clk_tree_defs.h"
